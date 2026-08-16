@@ -1,0 +1,58 @@
+{
+  "name": "@q1-digital/rag-engine",
+  "version": "0.1.0",
+  "description": "Production-grade RAG pipeline with hybrid search, reranking, citation extraction, and hallucination scoring",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest",
+    "test:coverage": "vitest --coverage",
+    "test:e2e": "vitest --config vitest.e2e.config.ts",
+    "lint": "eslint src/ --ext .ts",
+    "format": "prettier --write 'src/**/*.ts'",
+    "typecheck": "tsc --noEmit",
+    "bench": "tsx benchmarks/run.ts"
+  },
+  "keywords": [
+    "rag",
+    "retrieval-augmented-generation",
+    "vector-search",
+    "hybrid-search",
+    "reranking",
+    "chunking",
+    "embeddings",
+    "hallucination-detection",
+    "citation",
+    "typescript"
+  ],
+  "author": "Marcio Krefta <q1digitalfreela@gmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.9.0",
+    "openai": "^4.52.0",
+    "@anthropic-ai/sdk": "^0.24.0",
+    "zod": "^3.23.0",
+    "pino": "^9.1.0",
+    "tiktoken": "^1.0.15",
+    "natural": "^7.0.0",
+    "pdf-parse": "^1.1.1",
+    "mammoth": "^1.7.0",
+    "cheerio": "^1.0.0",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@vitest/coverage-v8": "^1.6.0",
+    "tsx": "^4.10.0",
+    "eslint": "^9.3.0",
+    "prettier": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
