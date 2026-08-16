@@ -5,77 +5,98 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20+-green.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Status: WIP](https://img.shields.io/badge/status-work%20in%20progress-orange.svg)](#project-status)
+
+## Project Status
+
+**Work in progress.** Core orchestration, hybrid retrieval fusion, recursive chunking, and hallucination scoring are implemented. Vector store adapters and provider wiring are in development. **No benchmark numbers are published yet.** The Evaluation section documents the methodology used to measure quality, not results.
+
+## Problem
+
+Naive RAG (embed everything, cosine similarity, stuff into prompt) fails in production:
+
+- **Semantic search misses exact terms.** Ask for error code `E4021` and dense retrieval returns conceptually similar errors, not that one.
+- **Fixed-size chunking splits mid-thought.** A table gets cut in half, a function signature separated from its description.
+- **Top-k similarity is not top-k relevance.** Embedding similarity is a weak proxy for answering the actual question.
+- **No grounding verification.** The model confidently states things absent from the sources, and nothing catches it.
+
+This engine addresses each failure mode with a specific mechanism: sparse retrieval for exact matches, semantic chunking for boundaries, cross-encoder reranking for true relevance, and claim-level entailment checking for grounding.
 
 ## Architecture
 
+### Ingestion
+
+```mermaid
+flowchart LR
+    A[Document] --> B[Parser<br/>PDF/DOCX/HTML/MD]
+    B --> C[Chunker<br/>strategy-driven]
+    C --> D[Metadata Enricher<br/>entities, topics]
+    D --> E[Embedder<br/>batched]
+    E --> F[(Vector Store)]
+    D --> G[(Sparse Index<br/>BM25)]
+    D --> H[(Metadata Store<br/>PostgreSQL)]
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                       INGESTION PIPELINE                        │
-│                                                                 │
-│  Document → Parser → Chunker → Embedder → Vector Store          │
-│     │                  │                        │                │
-│     │         ┌────────▼────────┐     ┌────────▼────────┐  │
-│     │         │ Metadata Store │     │ Sparse Index   │  │
-│     │         │ (PostgreSQL)  │     │ (BM25/SPLADE) │  │
-│     │         └─────────────────┘     └────────────────┘  │
-│     ▼                                                          │
-│  ┌────────────────┐                                              │
-│  │ Source Registry │                                              │
-│  └────────────────┘                                              │
-└─────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────┐
-│                       RETRIEVAL PIPELINE                        │
-│                                                                 │
-│  Query → Rewriter → Hybrid Search → Reranker → Context Builder  │
-│                         │                 │                      │
-│                ┌────────▼───────┐  ┌─────▼────────────┐     │
-│                │ Dense + Sparse │  │ Cross-Encoder  │     │
-│                │ Fusion (RRF)   │  │ (ms-marco)     │     │
-│                └────────────────┘  └──────────────────┘     │
-└─────────────────────────────────────────────────────────────┘
+### Retrieval and Generation
 
-┌─────────────────────────────────────────────────────────────┐
-│                       GENERATION PIPELINE                       │
-│                                                                 │
-│  Context → Prompt Builder → LLM → Citation Linker → Validator   │
-│                                        │              │         │
-│                               ┌────────▼─────┐  ┌─────▼─────┐  │
-│                               │ Source Map  │  │Hallucinate│  │
-│                               │ Attribution │  │ Detector  │  │
-│                               └──────────────┘  └───────────┘  │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Q[User Query] --> RW[Query Rewriter<br/>expansion / decomposition / HyDE]
+    RW --> DS[Dense Retriever<br/>vector similarity]
+    RW --> SS[Sparse Retriever<br/>BM25]
+    DS --> RRF[Reciprocal Rank Fusion]
+    SS --> RRF
+    RRF --> RR[Cross-Encoder Reranker]
+    RR --> CB[Context Builder<br/>token budget aware]
+    CB --> LLM[LLM Generation]
+    LLM --> CL[Citation Linker<br/>span attribution]
+    CL --> HS[Hallucination Scorer<br/>claim entailment]
+    HS --> OUT[Answer + Citations + Grounding Score]
 ```
 
 ## Core Concepts
 
 ### Chunking Strategies
 
-| Strategy | Use Case | Avg Chunk Size |
-|----------|----------|----------------|
-| `recursive` | General text, articles | 512 tokens |
-| `semantic` | Technical docs, code | Variable (by topic) |
-| `sliding-window` | Dense information | 256 tokens, 64 overlap |
-| `sentence` | Q&A, FAQs | 3-5 sentences |
-| `parent-child` | Hierarchical docs | Parent: 2048, Child: 256 |
+| Strategy | Mechanism | Best For |
+|----------|-----------|----------|
+| `recursive` | Hierarchical separator splitting (paragraph → line → sentence → word) | General prose, articles |
+| `semantic` | Embedding-based topic boundary detection | Technical docs, mixed-topic pages |
+| `sliding-window` | Fixed size with configurable overlap | Dense reference material |
+| `sentence` | Sentence-group boundaries | FAQs, Q&A pairs |
+| `parent-child` | Small chunks for matching, large parents for context | Hierarchical documentation |
 
-### Retrieval Fusion
+### Reciprocal Rank Fusion
 
-Hybrid search combines dense (vector similarity) and sparse (BM25/SPLADE) retrieval using Reciprocal Rank Fusion (RRF):
+Hybrid search runs dense and sparse retrieval in parallel, then fuses the two rankings:
 
 ```
-RRF_score(d) = Σ 1 / (k + rank_i(d))
+RRF_score(d) = Σ  w_i / (k + rank_i(d))
+               i
 ```
 
-Where `k` is a constant (default: 60) and `rank_i(d)` is the rank of document `d` in the i-th retrieval system.
+Where `rank_i(d)` is the 1-indexed rank of document `d` in retrieval system `i`, `w_i` is that system's weight, and `k` (default 60) dampens the influence of low-ranked results.
+
+**Why rank-based instead of score-based?** Dense retrieval returns cosine similarities in `[-1, 1]`; BM25 returns unbounded positive scores. Normalizing them against each other requires distribution assumptions that break across corpora. Ranks are directly comparable with zero normalization.
+
+### BM25 Sparse Scoring
+
+```
+score(D,Q) = Σ IDF(qᵢ) · ( f(qᵢ,D) · (k₁ + 1) ) / ( f(qᵢ,D) + k₁ · (1 - b + b · |D|/avgdl) )
+```
+
+With `k₁ = 1.2` (term frequency saturation) and `b = 0.75` (length normalization). This is the Okapi BM25 formulation.
 
 ### Hallucination Scoring
 
-Every generated response receives a grounding score:
-- **Claim extraction**: Split response into atomic claims
-- **Entailment check**: Verify each claim against source chunks
-- **Score**: Ratio of supported claims to total claims
-- **Threshold**: Responses below 0.85 are flagged for review
+Every generated response is decomposed and verified:
+
+1. **Claim extraction** — split the response into atomic factual statements, filtering out questions, hedges, and meta-commentary.
+2. **Entailment check** — for each claim, find the most relevant source chunk and test whether the source supports it.
+3. **Grounding score** — ratio of supported claims to total claims.
+4. **Decision** — `accept` above threshold, `review` in the grey zone, `reject` below.
+
+Approach informed by the FActScore (Min et al., 2023) and SAFE (Wei et al., 2024) literature on atomic-claim factuality evaluation.
 
 ## Installation
 
@@ -116,103 +137,75 @@ const rag = new RAGEngine({
   hallucination: {
     enabled: true,
     threshold: 0.85,
-    model: 'gpt-4o-mini', // lightweight judge
+    claimGranularity: 'atomic',
   },
 });
 
-// Ingest documents
 await rag.ingest([
-  { content: 'Full document text...', metadata: { source: 'docs/api.md', title: 'API Reference' } },
-  { content: 'Another document...', metadata: { source: 'docs/guide.md', title: 'User Guide' } },
+  { content: '...', metadata: { source: 'docs/api.md', title: 'API Reference' } },
 ]);
 
-// Query with citations
 const result = await rag.query('How do I authenticate with the API?');
 
-console.log(result.answer);       // Generated answer
-console.log(result.citations);    // [{source: 'docs/api.md', span: '...', relevance: 0.94}]
-console.log(result.groundingScore); // 0.92
-console.log(result.chunks);       // Retrieved chunks used for generation
+console.log(result.answer);
+console.log(result.citations);       // [{ source, span, relevance, chunkId }]
+console.log(result.groundingScore);  // 0..1
+console.log(result.metadata);        // queries used, chunks retrieved, latency
 ```
 
-## Advanced Usage
-
-### Multi-Query Retrieval
-
-```typescript
-// Decompose complex queries into sub-queries for better recall
-const result = await rag.query('Compare REST and GraphQL authentication methods', {
-  multiQuery: true,       // Generates 3 query variations
-  queryDecomposition: true, // Splits into sub-questions
-});
-```
-
-### Conversational RAG
+### Conversational Retrieval
 
 ```typescript
 const session = rag.createSession();
 
-const r1 = await session.query('What is the rate limit?');
-// Uses: "What is the rate limit?"
-
-const r2 = await session.query('How do I increase it?');
-// Rewrites to: "How do I increase the API rate limit?"
-// Context from r1 is carried forward
+await session.query('What is the rate limit?');
+await session.query('How do I increase it?');
+// Second query is rewritten to "How do I increase the API rate limit?"
+// using conversation history before retrieval runs.
 ```
 
-### Custom Chunking Pipeline
+### Multi-Query Retrieval
 
 ```typescript
-import { ChunkingPipeline, RecursiveChunker, MetadataEnricher } from '@q1-digital/rag-engine';
-
-const pipeline = new ChunkingPipeline([
-  new RecursiveChunker({ maxTokens: 512, overlap: 64 }),
-  new MetadataEnricher({ extractEntities: true, extractTopics: true }),
-  new ParentChildLinker({ parentSize: 2048 }),
-]);
-
-const chunks = await pipeline.process(document);
+const result = await rag.query(
+  'Compare REST and GraphQL authentication methods',
+  { multiQuery: true, topK: 8 },
+);
+// Generates query variations, retrieves for each, deduplicates,
+// then reranks the union against the original question.
 ```
 
 ## Configuration
 
 ```typescript
 interface RAGConfig {
-  vectorStore: VectorStoreConfig;
-  embedding: EmbeddingConfig;
-  chunking: ChunkingConfig;
-  reranker?: RerankerConfig;
-  generation: GenerationConfig;
-  hallucination?: HallucinationConfig;
-  cache?: CacheConfig;
-}
-
-interface VectorStoreConfig {
-  provider: 'qdrant' | 'weaviate' | 'pinecone' | 'pgvector';
-  url: string;
-  collection: string;
-  apiKey?: string;
-}
-
-interface ChunkingConfig {
-  strategy: 'recursive' | 'semantic' | 'sliding-window' | 'sentence' | 'parent-child';
-  maxTokens: number;
-  overlap?: number;
-  separators?: string[];
-}
-
-interface RerankerConfig {
-  model: string;
-  topK: number;
-  threshold?: number;  // Minimum score to include
-  batchSize?: number;
-}
-
-interface HallucinationConfig {
-  enabled: boolean;
-  threshold: number;   // 0-1, minimum grounding score
-  model: string;       // Judge model
-  claimGranularity?: 'sentence' | 'atomic';  // How to split claims
+  vectorStore: {
+    provider: 'qdrant' | 'weaviate' | 'pinecone' | 'pgvector';
+    url: string;
+    collection: string;
+    apiKey?: string;
+  };
+  embedding: {
+    provider: string;
+    model: string;
+    dimensions: number;
+  };
+  chunking: {
+    strategy: 'recursive' | 'semantic' | 'sliding-window' | 'sentence' | 'parent-child';
+    maxTokens: number;
+    overlap?: number;
+    separators?: string[];
+  };
+  reranker?: {
+    model: string;
+    topK: number;
+    threshold?: number;
+  };
+  hallucination?: {
+    enabled: boolean;
+    threshold: number;
+    claimGranularity?: 'sentence' | 'atomic';
+  };
 }
 ```
 
@@ -221,74 +214,65 @@ interface HallucinationConfig {
 ```
 src/
 ├── core/
-│   ├── engine.ts                # Main RAG orchestrator
-│   ├── config.ts                # Configuration validation
-│   └── session.ts               # Conversational session state
+│   ├── engine.ts                   # RAG orchestrator (ingest + query + session)
+│   ├── config.ts                   # Zod configuration schemas
+│   └── session.ts                  # Conversational state
 ├── ingestion/
-│   ├── pipeline.ts              # Ingestion orchestrator
-│   ├── parsers/
-│   │   ├── pdf.parser.ts        # PDF extraction
-│   │   ├── markdown.parser.ts   # Markdown parsing
-│   │   ├── html.parser.ts       # HTML to text
-│   │   └── docx.parser.ts       # DOCX extraction
+│   ├── pipeline.ts                 # Ingestion orchestration + batching
+│   ├── parsers/                    # PDF, DOCX, HTML, Markdown
 │   ├── chunkers/
-│   │   ├── recursive.chunker.ts
-│   │   ├── semantic.chunker.ts
+│   │   ├── recursive.chunker.ts     # Hierarchical separator splitting
+│   │   ├── semantic.chunker.ts      # Embedding boundary detection
 │   │   ├── sliding-window.chunker.ts
 │   │   └── parent-child.chunker.ts
-│   └── enrichers/
-│       ├── metadata.enricher.ts # Entity/topic extraction
-│       └── hierarchy.enricher.ts # Parent-child linking
+│   └── enrichers/                  # Entity + topic extraction
 ├── retrieval/
-│   ├── hybrid-search.ts         # Dense + sparse fusion
-│   ├── dense.retriever.ts       # Vector similarity search
-│   ├── sparse.retriever.ts      # BM25/SPLADE retrieval
-│   ├── reranker.ts              # Cross-encoder reranking
-│   ├── query-rewriter.ts        # Query expansion/decomposition
-│   └── fusion.ts                # Reciprocal Rank Fusion
+│   ├── hybrid-search.ts            # Dense + sparse orchestration
+│   ├── dense.retriever.ts
+│   ├── sparse.retriever.ts         # BM25
+│   ├── fusion.ts                   # Reciprocal Rank Fusion
+│   ├── reranker.ts                 # Cross-encoder reranking
+│   └── query-rewriter.ts           # Expansion, decomposition, HyDE
 ├── generation/
-│   ├── prompt-builder.ts        # Context-aware prompt assembly
-│   ├── citation-linker.ts       # Source attribution
-│   └── hallucination-scorer.ts  # Grounding verification
+│   ├── prompt-builder.ts           # Token-budget-aware context assembly
+│   ├── citation-linker.ts          # Span-level source attribution
+│   └── hallucination-scorer.ts     # Claim extraction + entailment
 ├── stores/
-│   ├── vector/
-│   │   ├── qdrant.store.ts
-│   │   ├── weaviate.store.ts
-│   │   ├── pinecone.store.ts
-│   │   └── pgvector.store.ts
-│   └── metadata/
-│       └── postgres.store.ts
-└── index.ts                     # Public API exports
+│   ├── vector/                     # Qdrant, Weaviate, Pinecone, pgvector
+│   └── metadata/                   # PostgreSQL
+└── index.ts
 ```
 
-## Evaluation Metrics
+## Evaluation Methodology
 
-| Metric | Description | Target |
-|--------|-------------|--------|
-| Recall@5 | % of relevant docs in top 5 | > 0.85 |
-| MRR | Mean Reciprocal Rank | > 0.75 |
-| NDCG@10 | Normalized Discounted Cumulative Gain | > 0.80 |
-| Grounding Score | % claims supported by sources | > 0.85 |
-| Latency P95 | End-to-end query time | < 2s |
-| Citation Precision | Correct attributions / total | > 0.90 |
+The engine is designed to be evaluated against these metrics. **No results are published yet** — the benchmark harness is on the roadmap.
 
-## Benchmarks
+| Metric | Definition | Measures |
+|--------|-----------|----------|
+| Recall@k | Fraction of relevant documents present in top k | Retrieval coverage |
+| MRR | Mean of `1/rank` of the first relevant result | How early the right answer appears |
+| NDCG@k | Rank-discounted gain vs. ideal ordering | Ranking quality with graded relevance |
+| Grounding Score | Supported claims / total claims | Factual faithfulness to sources |
+| Citation Precision | Correct attributions / total attributions | Whether citations point to the right span |
 
-| Dataset | Recall@5 | MRR | Latency P95 |
-|---------|----------|-----|-------------|
-| MS MARCO | 0.89 | 0.78 | 1.2s |
-| Natural Questions | 0.86 | 0.74 | 1.4s |
-| HotpotQA (multi-hop) | 0.81 | 0.69 | 1.8s |
-| Custom (internal) | 0.92 | 0.83 | 0.9s |
+Intended evaluation datasets: MS MARCO (passage ranking), Natural Questions (open-domain QA), HotpotQA (multi-hop reasoning).
+
+## Design Decisions
+
+**Why cross-encoder reranking instead of just retrieving more?** Bi-encoders embed query and document independently, so they can't model term interaction. A cross-encoder sees both together and scores actual relevance. It's too slow to run over a whole corpus, which is exactly why it runs over the retrieved candidate set.
+
+**Why parent-child chunking?** Small chunks match precisely but lack context for generation. Large chunks give context but dilute the embedding. Parent-child gets both: match on the small child, feed the model the large parent.
+
+**Why deduplicate before reranking?** Multi-query retrieval returns overlapping result sets. Reranking duplicates wastes cross-encoder compute, which is the most expensive step in the pipeline.
 
 ## Roadmap
 
-- [ ] Adaptive chunking (auto-select strategy per document type)
-- [ ] Streaming generation with incremental citation
-- [ ] Multi-modal RAG (images, tables, charts)
-- [ ] Knowledge graph integration for entity-based retrieval
-- [ ] Online learning from user feedback
-- [ ] Distributed ingestion with job queue
+- [ ] Vector store adapters (Qdrant, Weaviate, Pinecone, pgvector)
+- [ ] Reproducible benchmark harness with published methodology and results
+- [ ] Semantic chunker with embedding-based boundary detection
+- [ ] Streaming generation with incremental citation resolution
+- [ ] Multi-modal retrieval (tables, charts, images)
+- [ ] Knowledge graph integration for entity-centric retrieval
 
 ## License
 
