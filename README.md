@@ -1,279 +1,383 @@
 # rag-engine
 
-> Production-grade Retrieval-Augmented Generation pipeline: hybrid search (dense + sparse), multi-strategy chunking, cross-encoder reranking, citation extraction, and hallucination scoring.
+> RAG pipeline for TypeScript: hybrid retrieval with rank fusion, cross-encoder reranking, query rewriting, citation attribution, and grounding verification that detects contradiction rather than just absence.
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.4-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20+-green.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Status: WIP](https://img.shields.io/badge/status-work%20in%20progress-orange.svg)](#project-status)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-## Project Status
+> **Accuracy note.** Every example below is written against the exported API in
+> [`src/index.ts`](src/index.ts). Anything designed but not built is listed under
+> [Not implemented](#not-implemented) rather than shown as if it worked. No benchmark
+> number appears anywhere in this repository, because none has been measured.
 
-**Work in progress.** Core orchestration, hybrid retrieval fusion, recursive chunking, and hallucination scoring are implemented. Vector store adapters and provider wiring are in development. **No benchmark numbers are published yet.** The Evaluation section documents the methodology used to measure quality, not results.
+---
+
+## Status
+
+**Alpha, verified 2026-08-16.** The pipeline runs end to end with no external service:
+`npx tsx examples/01-hello-world.ts` ingests, retrieves and answers using in-memory
+adapters. No provider adapters for OpenAI, Qdrant or Anthropic ship with the package: you
+implement four small interfaces, or copy the ones in [`examples/`](examples/).
+
+---
 
 ## Problem
 
-Naive RAG (embed everything, cosine similarity, stuff into prompt) fails in production:
+Naive RAG (embed everything, cosine similarity, stuff into the prompt) fails in four
+specific ways. Each one has a mechanism here rather than a hope:
 
-- **Semantic search misses exact terms.** Ask for error code `E4021` and dense retrieval returns conceptually similar errors, not that one.
-- **Fixed-size chunking splits mid-thought.** A table gets cut in half, a function signature separated from its description.
-- **Top-k similarity is not top-k relevance.** Embedding similarity is a weak proxy for answering the actual question.
-- **No grounding verification.** The model confidently states things absent from the sources, and nothing catches it.
+| Failure | Mechanism |
+|---|---|
+| Dense search misses exact terms. Ask for error code `E4021` and you get conceptually similar errors. | BM25 sparse retrieval fused by rank, so an exact token match cannot be diluted |
+| Fixed-size chunking splits mid-thought | Recursive splitting down a separator hierarchy, paragraph before line before sentence |
+| Top-k similarity is not top-k relevance | Cross-encoder reranking over the retrieved candidate set |
+| The model states things absent from the sources | Claim-level verification that distinguishes *contradicted* from *unmentioned* |
 
-This engine addresses each failure mode with a specific mechanism: sparse retrieval for exact matches, semantic chunking for boundaries, cross-encoder reranking for true relevance, and claim-level entailment checking for grounding.
+The fourth is where most implementations stop at lexical overlap. Overlap alone rates a
+direct contradiction as well-grounded, because *"the limit is 100"* and *"the limit is
+**not** 100"* share every content word. This scorer treats polarity mismatch and numeric
+mismatch as contradiction, and any contradiction forces review regardless of the aggregate
+score.
 
-## Architecture
+---
 
-### Ingestion
-
-```mermaid
-flowchart LR
-    A[Document] --> B[Parser<br/>PDF/DOCX/HTML/MD]
-    B --> C[Chunker<br/>strategy-driven]
-    C --> D[Metadata Enricher<br/>entities, topics]
-    D --> E[Embedder<br/>batched]
-    E --> F[(Vector Store)]
-    D --> G[(Sparse Index<br/>BM25)]
-    D --> H[(Metadata Store<br/>PostgreSQL)]
-```
-
-### Retrieval and Generation
-
-```mermaid
-flowchart TD
-    Q[User Query] --> RW[Query Rewriter<br/>expansion / decomposition / HyDE]
-    RW --> DS[Dense Retriever<br/>vector similarity]
-    RW --> SS[Sparse Retriever<br/>BM25]
-    DS --> RRF[Reciprocal Rank Fusion]
-    SS --> RRF
-    RRF --> RR[Cross-Encoder Reranker]
-    RR --> CB[Context Builder<br/>token budget aware]
-    CB --> LLM[LLM Generation]
-    LLM --> CL[Citation Linker<br/>span attribution]
-    CL --> HS[Hallucination Scorer<br/>claim entailment]
-    HS --> OUT[Answer + Citations + Grounding Score]
-```
-
-## Core Concepts
-
-### Chunking Strategies
-
-| Strategy | Mechanism | Best For |
-|----------|-----------|----------|
-| `recursive` | Hierarchical separator splitting (paragraph → line → sentence → word) | General prose, articles |
-| `semantic` | Embedding-based topic boundary detection | Technical docs, mixed-topic pages |
-| `sliding-window` | Fixed size with configurable overlap | Dense reference material |
-| `sentence` | Sentence-group boundaries | FAQs, Q&A pairs |
-| `parent-child` | Small chunks for matching, large parents for context | Hierarchical documentation |
-
-### Reciprocal Rank Fusion
-
-Hybrid search runs dense and sparse retrieval in parallel, then fuses the two rankings:
-
-```
-RRF_score(d) = Σ  w_i / (k + rank_i(d))
-               i
-```
-
-Where `rank_i(d)` is the 1-indexed rank of document `d` in retrieval system `i`, `w_i` is that system's weight, and `k` (default 60) dampens the influence of low-ranked results.
-
-**Why rank-based instead of score-based?** Dense retrieval returns cosine similarities in `[-1, 1]`; BM25 returns unbounded positive scores. Normalizing them against each other requires distribution assumptions that break across corpora. Ranks are directly comparable with zero normalization.
-
-### BM25 Sparse Scoring
-
-```
-score(D,Q) = Σ IDF(qᵢ) · ( f(qᵢ,D) · (k₁ + 1) ) / ( f(qᵢ,D) + k₁ · (1 - b + b · |D|/avgdl) )
-```
-
-With `k₁ = 1.2` (term frequency saturation) and `b = 0.75` (length normalization). This is the Okapi BM25 formulation.
-
-### Hallucination Scoring
-
-Every generated response is decomposed and verified:
-
-1. **Claim extraction** — split the response into atomic factual statements, filtering out questions, hedges, and meta-commentary.
-2. **Entailment check** — for each claim, find the most relevant source chunk and test whether the source supports it.
-3. **Grounding score** — ratio of supported claims to total claims.
-4. **Decision** — `accept` above threshold, `review` in the grey zone, `reject` below.
-
-Approach informed by the FActScore (Min et al., 2023) and SAFE (Wei et al., 2024) literature on atomic-claim factuality evaluation.
-
-## Installation
+## Install
 
 ```bash
 npm install @q1-digital/rag-engine
 ```
 
-## Quick Start
+Not published to npm yet. Clone and build locally: see [Development](#development).
+
+---
+
+## Quick start
+
+This is [`examples/01-hello-world.ts`](examples/01-hello-world.ts), reduced. It runs with
+no API key, because the adapters are in-memory.
 
 ```typescript
 import { RAGEngine } from '@q1-digital/rag-engine';
+import {
+  HashingEmbedder,
+  MemoryVectorStore,
+  ExtractiveGenerator,
+} from './examples/in-memory-adapters.js';
 
-const rag = new RAGEngine({
-  vectorStore: {
-    provider: 'qdrant',
-    url: process.env.QDRANT_URL!,
-    collection: 'documents',
-  },
-  embedding: {
-    provider: 'openai',
-    model: 'text-embedding-3-large',
-    dimensions: 3072,
-  },
-  chunking: {
-    strategy: 'recursive',
-    maxTokens: 512,
-    overlap: 64,
-  },
-  reranker: {
-    model: 'cross-encoder/ms-marco-MiniLM-L-12-v2',
-    topK: 5,
-  },
-  generation: {
-    provider: 'anthropic',
-    model: 'claude-sonnet-4-20250514',
-    maxTokens: 2048,
-  },
-  hallucination: {
-    enabled: true,
-    threshold: 0.85,
-    claimGranularity: 'atomic',
-  },
+const engine = new RAGEngine({
+  embedding: new HashingEmbedder(),
+  vectorStore: new MemoryVectorStore(),
+  generation: new ExtractiveGenerator(),
+  chunking: { maxTokens: 40, overlap: 8 },
 });
 
-await rag.ingest([
-  { content: '...', metadata: { source: 'docs/api.md', title: 'API Reference' } },
+await engine.ingest([
+  {
+    content: 'The default rate limit is 1000 requests per minute per key.',
+    metadata: { source: 'docs/rate-limits.md', title: 'Rate Limits' },
+  },
 ]);
 
-const result = await rag.query('How do I authenticate with the API?');
+const result = await engine.query('What is the rate limit?');
 
 console.log(result.answer);
-console.log(result.citations);       // [{ source, span, relevance, chunkId }]
-console.log(result.groundingScore);  // 0..1
-console.log(result.metadata);        // queries used, chunks retrieved, latency
+console.log(result.metadata.inferenceCalls);  // cost is attributable per query
+console.log(result.grounding);                // null when no scorer is configured
+
+engine.dispose();  // releases the tiktoken encoder
 ```
 
-### Conversational Retrieval
-
-```typescript
-const session = rag.createSession();
-
-await session.query('What is the rate limit?');
-await session.query('How do I increase it?');
-// Second query is rewritten to "How do I increase the API rate limit?"
-// using conversation history before retrieval runs.
+```bash
+npx tsx examples/01-hello-world.ts
 ```
 
-### Multi-Query Retrieval
+**`result.grounding` is a discriminated union, not a number.** `{ verifiable: false,
+reason: 'no_sources' }` and `{ verifiable: true, groundingScore: 0 }` are opposite
+situations, and a bare `0` conflates "nothing to check" with "entirely fabricated".
 
-```typescript
-const result = await rag.query(
-  'Compare REST and GraphQL authentication methods',
-  { multiQuery: true, topK: 8 },
-);
-// Generates query variations, retrieves for each, deduplicates,
-// then reranks the union against the original question.
+---
+
+## Adapters you implement
+
+The library talks to four interfaces and constructs none of them. Provider names are not
+configuration: a string cannot carry a credential, a base URL or a retry policy.
+
+| Interface | Required | Method |
+|---|---|---|
+| `EmbeddingAdapter` | yes | `embed(texts: string[]): Promise<number[][]>` |
+| `VectorStoreAdapter` | yes | `query(embedding, topK)`, `upsert(chunks)` |
+| `GenerationAdapter` | yes | `complete(prompt: string): Promise<string>` |
+| `SparseIndexAdapter` | no | `query(tokens, topK)`, optional `index(chunks)` |
+
+Omitting the sparse index is a real trade-off, not a minor one: retrieval becomes
+dense-only, so an error code or identifier retrieves conceptually similar documents instead
+of the one that names it.
+
+Working implementations of all four live in
+[`examples/in-memory-adapters.ts`](examples/in-memory-adapters.ts). The BM25 index there is
+genuine Okapi BM25; the embedder is deliberately lexical and says so.
+
+**Consequence worth knowing:** this library reads no environment variables. Credentials
+live in the adapters you build, so there is no `.env` surface here and no `.env.example` to
+keep in sync.
+
+---
+
+## Pipeline
+
+```mermaid
+flowchart TD
+    Q[Question] --> RW[Query rewriter<br/>expansion / decomposition / contextualization]
+    RW --> D[Dense retrieval<br/>EmbeddingAdapter + VectorStoreAdapter]
+    RW --> S[Sparse retrieval<br/>SparseIndexAdapter, optional]
+    D --> F[Reciprocal Rank Fusion<br/>weighted, agreement-aware]
+    S --> F
+    F --> R[Cross-encoder reranker<br/>batched, optional]
+    R --> P[Prompt assembly<br/>numbered sources]
+    P --> G[GenerationAdapter]
+    G --> C[Citation attribution<br/>offset-preserving, optional]
+    C --> H[Grounding verification<br/>supported / contradicted / unmentioned, optional]
+    H --> OUT[Answer + citations + verdict + cost]
 ```
 
-## Configuration
+Every optional stage is genuinely optional. Without a reranker, retrieval order is used
+directly. Without a scorer, `grounding` is `null` rather than a fabricated `1.0`.
+
+When retrieval returns nothing, the engine **does not generate**. An answer produced from
+zero sources has nothing grounding it, which is the failure this pipeline exists to prevent.
+
+---
+
+## Chunking
+
+Two chunkers exist.
+
+| Chunker | Mechanism | Cost |
+|---|---|---|
+| `RecursiveChunker` | Hierarchical separator splitting: paragraph, line, sentence, clause, word, character. Token-counted with tiktoken. | Free, no inference |
+| `SemanticChunker` | Embeds sliding sentence windows and splits at similarity valleys | One embedding call per window |
+
+`RAGEngine` uses `RecursiveChunker`. `SemanticChunker` is exported and usable directly, but
+is not yet wired into the engine's ingest path.
 
 ```typescript
-interface RAGConfig {
-  vectorStore: {
-    provider: 'qdrant' | 'weaviate' | 'pinecone' | 'pgvector';
-    url: string;
-    collection: string;
-    apiKey?: string;
-  };
-  embedding: {
-    provider: string;
-    model: string;
-    dimensions: number;
-  };
-  chunking: {
-    strategy: 'recursive' | 'semantic' | 'sliding-window' | 'sentence' | 'parent-child';
-    maxTokens: number;
-    overlap?: number;
-    separators?: string[];
-  };
-  reranker?: {
-    model: string;
-    topK: number;
-    threshold?: number;
-  };
-  hallucination?: {
-    enabled: boolean;
-    threshold: number;
-    claimGranularity?: 'sentence' | 'atomic';
-  };
+chunking: {
+  maxTokens: 512,
+  overlap: 64,
+  separators: ['\n\n', '\n', '. ', ', ', ' ', ''],  // optional, this is the default
 }
 ```
 
-## Project Structure
+---
+
+## Rank fusion
+
+Dense and sparse rankings are fused by rank, not by score:
+
+```
+RRF(d) = SUM over systems i of   w_i / (k + rank_i(d))
+```
+
+`rank_i(d)` is 1-indexed, `w_i` is that retriever's weight, and `k` (default 60) dampens
+low-ranked contributions.
+
+**Why rank and not score.** Dense retrieval returns cosine similarities in `[-1,1]`; BM25
+returns unbounded positive scores. Normalizing one against the other requires distribution
+assumptions that break across corpora. Ranks are directly comparable with no normalization
+at all.
+
+Ties break on **agreement first**: a chunk both retrievers found outranks one a single
+retriever ranked highly. `SearchResult.agreementCount` reports how many chunks both found,
+and `SearchResult.degraded` names a retriever that failed, so a degraded result is
+distinguishable from a genuinely thin one.
+
+The BM25 implementation in the examples uses the Okapi formulation with `k1 = 1.2` and
+`b = 0.75`:
+
+```
+score(D,Q) = SUM IDF(qi) * ( f(qi,D) * (k1 + 1) )
+                         / ( f(qi,D) + k1 * (1 - b + b * |D|/avgdl) )
+
+IDF(qi)    = ln( 1 + (N - n(qi) + 0.5) / (n(qi) + 0.5) )
+```
+
+The `0.5` smoothing and outer `1 +` are not decoration: without them a term appearing in
+more than half the corpus produces a negative IDF, and a document containing it scores
+*worse* than one that does not.
+
+---
+
+## Grounding verification
+
+```typescript
+hallucination: {
+  enabled: true,
+  threshold: 0.8,
+  claimGranularity: 'sentence',   // 'atomic' requires a decompose function
+  containmentThreshold: 0.6,
+  entail: async (claim, source) => 'supported',  // optional: real NLI
+}
+```
+
+Three verdicts per claim, not two:
+
+| Verdict | Meaning |
+|---|---|
+| `supported` | The source contains the claim |
+| `contradicted` | The source states the opposite, by polarity or by figure |
+| `unmentioned` | The source is silent |
+
+Contradiction is penalised beyond simply not counting as support, and **any** contradiction
+forces at least `review`. A response can be 90% grounded and assert the opposite of a
+source on the one claim that matters; averaging that away is how a confidently wrong answer
+ships.
+
+**The built-in verifier is lexical, and that is a real limitation.** It measures whether a
+claim's vocabulary appears in the source, which is a proxy for entailment and not
+entailment. It cannot detect a correct paraphrase that shares no vocabulary, and it cannot
+verify a genuine logical inference. Supply `entail` for real NLI. The heuristic exists so
+the pipeline degrades to something useful rather than to nothing.
+
+Approach informed by the atomic-claim factuality literature: FActScore (Min et al., 2023)
+and SAFE (Wei et al., 2024).
+
+---
+
+## Citations
+
+```typescript
+citations: {
+  embed: (texts) => myEmbedder.embed(texts),
+  citationThreshold: 0.65,
+  maxCitationsPerSentence: 3,
+}
+```
+
+Markers are assigned in order of first appearance, so `[1]` is the first citation in the
+text and matches bibliography entry `1`. Formatting is preserved: markers are inserted into
+the original string at recorded offsets rather than by rejoining split sentences, so
+newlines, lists and code blocks survive.
+
+`uncitedSentences` is reported with the best similarity found for each, because a sentence
+without a citation is not automatically a problem. A transition has nothing to cite, and
+distinguishing that from an unsupported assertion needs the list.
+
+**Threshold direction matters.** Too low and every sentence gets a citation including the
+fabricated ones, which is worse than no citations at all: it launders invention as sourced
+fact. A missing citation is visible; a wrong one is not.
+
+---
+
+## Repository structure
+
+Only what exists.
 
 ```
 src/
 ├── core/
-│   ├── engine.ts                   # RAG orchestrator (ingest + query + session)
-│   ├── config.ts                   # Zod configuration schemas
-│   └── session.ts                  # Conversational state
+│   ├── config.ts                  # Adapter interfaces, domain types, RAGConfig
+│   └── engine.ts                  # RAGEngine, RAGSession
 ├── ingestion/
-│   ├── pipeline.ts                 # Ingestion orchestration + batching
-│   ├── parsers/                    # PDF, DOCX, HTML, Markdown
-│   ├── chunkers/
-│   │   ├── recursive.chunker.ts     # Hierarchical separator splitting
-│   │   ├── semantic.chunker.ts      # Embedding boundary detection
-│   │   ├── sliding-window.chunker.ts
-│   │   └── parent-child.chunker.ts
-│   └── enrichers/                  # Entity + topic extraction
+│   └── chunkers/
+│       ├── recursive.chunker.ts   # Separator hierarchy, tiktoken-counted
+│       └── semantic.chunker.ts    # Embedding-boundary splitting
 ├── retrieval/
-│   ├── hybrid-search.ts            # Dense + sparse orchestration
-│   ├── dense.retriever.ts
-│   ├── sparse.retriever.ts         # BM25
-│   ├── fusion.ts                   # Reciprocal Rank Fusion
-│   ├── reranker.ts                 # Cross-encoder reranking
-│   └── query-rewriter.ts           # Expansion, decomposition, HyDE
+│   ├── hybrid-search.ts           # Dense + sparse, RRF, partial-failure degradation
+│   ├── reranker.ts                # Batched cross-encoder scoring
+│   └── query-rewriter.ts          # Expansion, decomposition, HyDE, contextualization
 ├── generation/
-│   ├── prompt-builder.ts           # Token-budget-aware context assembly
-│   ├── citation-linker.ts          # Span-level source attribution
-│   └── hallucination-scorer.ts     # Claim extraction + entailment
-├── stores/
-│   ├── vector/                     # Qdrant, Weaviate, Pinecone, pgvector
-│   └── metadata/                   # PostgreSQL
+│   ├── citation-extractor.ts      # Offset-preserving attribution
+│   └── hallucination-scorer.ts    # Claim verification with contradiction detection
 └── index.ts
+
+examples/
+├── in-memory-adapters.ts          # Runnable adapters: hashing embedder, BM25, extractive generator
+├── 01-hello-world.ts              # Minimum config
+└── 02-full-pipeline.ts            # Every stage, plus contradiction detection
 ```
 
-## Evaluation Methodology
+---
 
-The engine is designed to be evaluated against these metrics. **No results are published yet** — the benchmark harness is on the roadmap.
+## Not implemented
 
-| Metric | Definition | Measures |
-|--------|-----------|----------|
-| Recall@k | Fraction of relevant documents present in top k | Retrieval coverage |
-| MRR | Mean of `1/rank` of the first relevant result | How early the right answer appears |
-| NDCG@k | Rank-discounted gain vs. ideal ordering | Ranking quality with graded relevance |
-| Grounding Score | Supported claims / total claims | Factual faithfulness to sources |
-| Citation Precision | Correct attributions / total attributions | Whether citations point to the right span |
+Listed because a limitation found by a reader at 3 AM is worse than one written down.
 
-Intended evaluation datasets: MS MARCO (passage ranking), Natural Questions (open-domain QA), HotpotQA (multi-hop reasoning).
+| Gap | Consequence |
+|---|---|
+| **No provider adapters** | You implement `EmbeddingAdapter`, `VectorStoreAdapter` and `GenerationAdapter`, or copy from `examples/`. Nothing for OpenAI, Anthropic, Qdrant, Weaviate, Pinecone or pgvector ships here. |
+| **No document parsers** | `ingest()` takes strings. PDF, DOCX and HTML parsing do not exist, and the dependencies that would have powered them were removed because nothing imported them. |
+| **No metadata store** | Chunk metadata lives with the chunk in the vector store. There is no separate queryable store. |
+| **`SemanticChunker` not wired into the engine** | Exported and usable directly; `RAGEngine` always uses `RecursiveChunker`. |
+| **HyDE not reachable from `query()`** | `QueryRewriter.hyde()` is implemented and exported. The engine selects contextualization, decomposition or expansion, never HyDE. |
+| **No test suite** | `npm test` runs vitest against zero test files. Nothing in `src/` is covered. |
+| **No CI workflow** | `.github/` exists but contains no workflow, so nothing gates a merge. |
+| **No benchmarks** | No measured numbers, anywhere. The metrics below are a measurement plan. |
 
-## Design Decisions
+---
 
-**Why cross-encoder reranking instead of just retrieving more?** Bi-encoders embed query and document independently, so they can't model term interaction. A cross-encoder sees both together and scores actual relevance. It's too slow to run over a whole corpus, which is exactly why it runs over the retrieved candidate set.
+## Evaluation plan
 
-**Why parent-child chunking?** Small chunks match precisely but lack context for generation. Large chunks give context but dilute the embedding. Parent-child gets both: match on the small child, feed the model the large parent.
+No results, only the intended methodology. Publishing a number here without a reproducible
+run is the fastest way to lose a reader's trust.
 
-**Why deduplicate before reranking?** Multi-query retrieval returns overlapping result sets. Reranking duplicates wastes cross-encoder compute, which is the most expensive step in the pipeline.
+| Metric | Measures |
+|---|---|
+| Recall@k | Retrieval coverage |
+| MRR | How early the first relevant result appears |
+| NDCG@k | Ranking quality with graded relevance |
+| Grounding score | Faithfulness to sources |
+| Citation precision | Whether a marker points at the passage that supports the sentence |
 
-## Roadmap
+Intended datasets: MS MARCO, Natural Questions, HotpotQA.
 
-- [ ] Vector store adapters (Qdrant, Weaviate, Pinecone, pgvector)
-- [ ] Reproducible benchmark harness with published methodology and results
-- [ ] Semantic chunker with embedding-based boundary detection
-- [ ] Streaming generation with incremental citation resolution
-- [ ] Multi-modal retrieval (tables, charts, images)
-- [ ] Knowledge graph integration for entity-centric retrieval
+---
+
+## Design decisions
+
+**Why containment instead of Jaccard for grounding.** Jaccard divides by the union, so a
+12-token claim against a 400-token chunk caps near 0.03 and can never clear a 0.3
+threshold. Every claim against a realistically sized source would read as unsupported.
+Grounding asks what fraction of the *claim* appears in the source, which is asymmetric by
+nature.
+
+**Why the reranker filters on raw scores.** Min-max normalization maps the observed minimum
+to 0 and maximum to 1, so a threshold on normalized scores always keeps roughly the top
+fraction regardless of absolute relevance: five irrelevant candidates survive a set of ten
+irrelevant ones. Normalization is presentation only, and `rawScore` is always returned.
+
+**Why cross-encoder reranking rather than retrieving more.** A bi-encoder embeds query and
+document independently and cannot model term interaction. A cross-encoder sees both, which
+is also why it is too slow for a corpus and belongs over a candidate set.
+
+**Why a partial retriever failure degrades instead of throwing.** A sparse index outage
+should not fail a query dense retrieval alone can answer. `SearchResult.degraded` names the
+casualty so the caller can tell degraded from thin.
+
+---
+
+## Development
+
+```bash
+git clone https://github.com/kreftamarcio/rag-engine.git
+cd rag-engine
+npm install
+
+npm run typecheck   # tsc --noEmit, strict
+npm run lint
+npm run build       # emits dist/ from src/ only
+npm test            # currently zero test files
+
+npx tsx examples/01-hello-world.ts
+npx tsx examples/02-full-pipeline.ts
+```
+
+`examples/` is outside the `tsconfig.json` include set, so `npm run typecheck` does not
+cover it. Running the examples is the check for that directory.
+
+---
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
