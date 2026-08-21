@@ -2,22 +2,45 @@ name: Security Audit
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main]
   pull_request:
-    branches: [ main, master ]
+    branches: [main]
   schedule:
-    - cron: '0 0 * * 0' # Weekly
+    - cron: '0 0 * * 0'
+
+permissions:
+  contents: read
 
 jobs:
   audit:
+    name: Dependency and secret audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-      - name: NPM Audit
-        run: npm audit --audit-level=high || echo "Audit completed (ignoring errors for CI stability)"
-      - name: Gitleaks (Secret Scanner)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 20
+
+      # npm audit requires a lockfile. There is none committed yet, so one is
+      # resolved here. Results can shift when upstream publishes an advisory,
+      # which is the intended behaviour of a security gate.
+      - name: Resolve dependency tree
+        run: npm install --package-lock-only --no-audit --no-fund
+
+      # INVARIANT: this step fails the build. No `|| echo`, no advisory mode.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan for secrets
+        run: gitleaks detect --source . --verbose --redact --exit-code 1
